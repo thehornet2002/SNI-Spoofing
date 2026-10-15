@@ -175,6 +175,59 @@ class NpcapDirectSender:
         ret = wpcap.pcap_sendpacket(self.pcap_handle, frame, len(frame))
         return ret == 0
 
+    def inject_fake_connection(self, src_ip: str, src_port: int, dst_ip: str, dst_port: int,
+                               fake_payload: bytes, config):
+        try:
+            import scapy.all as scapy
+            from utils.packet_templates import HttpProbeMaker
+
+            src_mac_str = ':'.join(f'{b:02x}' for b in self.src_mac) if self.src_mac else None
+            gw_mac_str = ':'.join(f'{b:02x}' for b in self.gw_mac) if self.gw_mac else None
+
+            # 1. Fake HTTP probe if requested
+            http_mode = getattr(config, "fake_http", "none")
+            if http_mode in ("get", "head"):
+                if http_mode == "head":
+                    http_data = f"HEAD / HTTP/1.1\r\nHost: {config.fake_sni}\r\nUser-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n".encode()
+                else:
+                    http_data = HttpProbeMaker.get_fake_get(config.fake_sni)
+                pkt = scapy.IP(src=src_ip, dst=dst_ip) / scapy.TCP(sport=src_port, dport=dst_port, flags="PA") / http_data
+                if self.datalink == 1 and src_mac_str and gw_mac_str:
+                    frame = scapy.Ether(src=src_mac_str, dst=gw_mac_str) / pkt
+                    scapy.sendp(frame, iface=self.dev_name, verbose=False)
+                else:
+                    scapy.send(pkt, iface=self.dev_name, verbose=False)
+
+            # 2. Fake TLS ClientHello
+            tcp_kwargs = {"sport": src_port, "dport": dst_port, "flags": "PA"}
+            o_type = getattr(config, "seq_offset_type", "classic")
+            if o_type == "offset":
+                tcp_kwargs["seq"] = (1000000 + config.seq_offset_val) & 0xffffffff
+            elif o_type == "abs":
+                tcp_kwargs["seq"] = config.seq_offset_val & 0xffffffff
+            else:
+                tcp_kwargs["seq"] = (1000000 - len(fake_payload)) & 0xffffffff
+
+            pkt = scapy.IP(src=src_ip, dst=dst_ip) / scapy.TCP(**tcp_kwargs) / fake_payload
+
+            if self.datalink == 1 and src_mac_str and gw_mac_str:
+                frame = scapy.Ether(src=src_mac_str, dst=gw_mac_str) / pkt
+                scapy.sendp(frame, iface=self.dev_name, verbose=False)
+            else:
+                scapy.send(pkt, iface=self.dev_name, verbose=False)
+
+            # 3. Fake RST if requested
+            if getattr(config, "fake_rst", False):
+                pkt_rst = scapy.IP(src=src_ip, dst=dst_ip) / scapy.TCP(sport=src_port, dport=dst_port, flags="R")
+                if self.datalink == 1 and src_mac_str and gw_mac_str:
+                    frame = scapy.Ether(src=src_mac_str, dst=gw_mac_str) / pkt_rst
+                    scapy.sendp(frame, iface=self.dev_name, verbose=False)
+                else:
+                    scapy.send(pkt_rst, iface=self.dev_name, verbose=False)
+
+        except Exception as e:
+            logger.debug("Npcap direct inject exception: %s", e)
+
     def send_raw(self, packet_bytes: bytes) -> bool:
         if not self.pcap_handle:
             return False

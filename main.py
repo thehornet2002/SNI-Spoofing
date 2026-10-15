@@ -1,10 +1,51 @@
 import argparse
+import ctypes
 import logging
+import os
 import signal
+import subprocess
 import sys
 import time
 
 from engine import ProxyEngine, load_config_file
+
+
+def is_admin() -> bool:
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+def restart_as_admin():
+    try:
+        project_dir = os.path.dirname(os.path.abspath(__file__))
+        script = os.path.join(project_dir, "main.py")
+        params = " ".join([f'"{arg}"' for arg in sys.argv[1:] if arg != "--no-elevate"])
+        ret = ctypes.windll.shell32.ShellExecuteW(
+            None,
+            "runas",
+            sys.executable,
+            f'"{script}" {params}',
+            project_dir,
+            1
+        )
+        if ret > 32:
+            sys.exit(0)
+    except Exception as e:
+        print(f"Failed to elevate to administrator: {e}")
+
+
+def ensure_system_permissions():
+    """Ensure working directory and network driver service readiness."""
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    os.chdir(project_dir)
+
+    # Start Npcap service if not running
+    try:
+        subprocess.run(["sc.exe", "start", "npcap"], capture_output=True, timeout=2, creationflags=0x08000000)
+    except Exception:
+        pass
 
 
 def run_cli():
@@ -45,8 +86,11 @@ def run_cli():
 
 
 def main():
+    ensure_system_permissions()
+
     parser = argparse.ArgumentParser(description="SNI Spoofing & DPI Bypass")
     parser.add_argument("--cli", action="store_true", help="Run in headless CLI mode instead of GUI")
+    parser.add_argument("--no-elevate", action="store_true", help="Do not attempt auto-elevation")
     args = parser.parse_args()
 
     if args.cli:
@@ -61,4 +105,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if not is_admin() and "--no-elevate" not in sys.argv and "-h" not in sys.argv and "--help" not in sys.argv:
+        restart_as_admin()
     main()

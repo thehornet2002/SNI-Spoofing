@@ -2,8 +2,14 @@ import asyncio
 from dataclasses import dataclass
 import logging
 import socket
+import sys
 import threading
-from pydivert import Packet
+import time
+
+try:
+    from pydivert import Packet
+except ImportError:
+    Packet = None
 
 from monitor_connection import MonitorConnection
 from injecter import TcpInjector
@@ -15,18 +21,12 @@ logger = logging.getLogger("FakeTcp")
 @dataclass
 class BypassConfig:
     wrong_seq: bool = True
-    low_ttl: bool = False
-    fake_ttl: int = 5
-    wrong_chksum: bool = False
+    seq_offset_type: str = "classic"  # 'classic', 'offset', 'abs'
+    seq_offset_val: int = -1
+    fake_http: str = "none"  # 'none', 'get', 'head'
     fake_rst: bool = False
-    fake_http: bool = False
-    tls_frag: bool = False
-    frag_mode: str = "sni"  # 'sni', 'record_header', 'tiny'
-    fake_ech: bool = False
-    tcp_overlap: bool = False
-    tcp_md5: bool = False
-    use_npcap: bool = False
-    fake_sni: str = "auth.vercel.com"
+    fake_sni: str = "hcaptcha.com"
+    use_npcap: bool = True
 
 
 class FakeInjectiveConnection(MonitorConnection):
@@ -52,7 +52,7 @@ class FakeTcpInjector(TcpInjector):
         self.bypass_config = bypass_config
         self.npcap_sender = npcap_sender
 
-    def _send_fake_packet(self, packet: Packet, recalculate_checksum: bool):
+    def _send_fake_packet(self, packet: Packet, recalculate_checksum: bool = True):
         if self.bypass_config.use_npcap and self.npcap_sender:
             if recalculate_checksum:
                 packet.recalculate_checksums()
@@ -60,27 +60,36 @@ class FakeTcpInjector(TcpInjector):
         else:
             self.w.send(packet, recalculate_checksum)
 
-    def _send_fake_http(self, base_packet: Packet, connection: FakeInjectiveConnection):
+    def _send_fake_http(self, base_packet: Packet, connection: FakeInjectiveConnection, method: str = "get"):
         try:
-            http_payload = HttpProbeMaker.get_fake_get(self.bypass_config.fake_sni)
+            if method == "head":
+                http_payload = f"HEAD / HTTP/1.1\r\nHost: {self.bypass_config.fake_sni}\r\nUser-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n".encode()
+            else:
+                http_payload = HttpProbeMaker.get_fake_get(self.bypass_config.fake_sni)
+
             pkt = base_packet
             pkt.tcp.psh = True
+            pkt.tcp.ack = True
+            pkt.tcp.syn = False
+            pkt.tcp.rst = False
+            pkt.tcp.fin = False
             pkt.tcp.payload = http_payload
             pkt.ip.packet_len = pkt.ip.header_len + pkt.tcp.header_len + len(http_payload)
             if pkt.ipv4:
                 pkt.ipv4.ident = (pkt.ipv4.ident + 1) & 0xffff
-                if self.bypass_config.low_ttl:
-                    pkt.ipv4.ttl = self.bypass_config.fake_ttl
-            if self.bypass_config.wrong_seq:
-                pkt.tcp.seq_num = (connection.syn_seq + 1 - len(http_payload)) & 0xffffffff
-            else:
-                pkt.tcp.seq_num = (connection.syn_seq + 1) & 0xffffffff
 
-            if self.bypass_config.wrong_chksum:
-                pkt.tcp.cksum = 0xbeef
-                self._send_fake_packet(pkt, False)
+            # Set seq number matching configuration
+            cfg = self.bypass_config
+            if cfg.seq_offset_type == "classic":
+                pkt.tcp.seq_num = (connection.syn_seq + 1 - len(http_payload)) & 0xffffffff
+            elif cfg.seq_offset_type == "offset":
+                pkt.tcp.seq_num = (connection.syn_seq + 1 + cfg.seq_offset_val) & 0xffffffff
+            elif cfg.seq_offset_type == "abs":
+                pkt.tcp.seq_num = cfg.seq_offset_val & 0xffffffff
             else:
-                self._send_fake_packet(pkt, True)
+                pkt.tcp.seq_num = (connection.syn_seq + 1 - len(http_payload)) & 0xffffffff
+
+            self._send_fake_packet(pkt, True)
             logger.debug("Sent fake HTTP probe for %s", connection.id)
         except Exception as e:
             logger.debug("Error sending fake HTTP: %s", e)
@@ -97,7 +106,6 @@ class FakeTcpInjector(TcpInjector):
             pkt.ip.packet_len = pkt.ip.header_len + pkt.tcp.header_len
             if pkt.ipv4:
                 pkt.ipv4.ident = (pkt.ipv4.ident + 2) & 0xffff
-                pkt.ipv4.ttl = self.bypass_config.fake_ttl if self.bypass_config.low_ttl else 4
             pkt.tcp.seq_num = (connection.syn_seq + 1 + len(connection.fake_data)) & 0xffffffff
             self._send_fake_packet(pkt, True)
             logger.debug("Sent fake RST poison packet for %s", connection.id)
@@ -109,59 +117,49 @@ class FakeTcpInjector(TcpInjector):
             if not connection.monitor:
                 return
 
-            cfg = connection.bypass_config
+            cfg = self.bypass_config
 
-            # Strategy 1: Fake HTTP probe prior to TLS
-            if cfg.fake_http:
-                self._send_fake_http(packet, connection)
+            # 1. Fake HTTP probe if enabled
+            if cfg.fake_http in ("get", "head"):
+                self._send_fake_http(packet, connection, method=cfg.fake_http)
 
-            # Strategy 2: Fake TLS ClientHello
+            # 2. Main Fake TLS ClientHello Packet
             packet.tcp.psh = True
+            packet.tcp.ack = True
+            packet.tcp.syn = False
+            packet.tcp.rst = False
+            packet.tcp.fin = False
             packet.tcp.payload = connection.fake_data
             packet.ip.packet_len = packet.ip.header_len + packet.tcp.header_len + len(connection.fake_data)
             if packet.ipv4:
                 packet.ipv4.ident = (packet.ipv4.ident + 1) & 0xffff
-                if cfg.low_ttl:
-                    packet.ipv4.ttl = cfg.fake_ttl
 
-            if cfg.wrong_seq:
+            # Set Sequence Number based on offset
+            if cfg.seq_offset_type == "classic":
                 packet.tcp.seq_num = (connection.syn_seq + 1 - len(packet.tcp.payload)) & 0xffffffff
-            elif cfg.tcp_overlap:
-                packet.tcp.seq_num = (connection.syn_seq + 1) & 0xffffffff
+            elif cfg.seq_offset_type == "offset":
+                packet.tcp.seq_num = (connection.syn_seq + 1 + cfg.seq_offset_val) & 0xffffffff
+            elif cfg.seq_offset_type == "abs":
+                packet.tcp.seq_num = cfg.seq_offset_val & 0xffffffff
             else:
                 packet.tcp.seq_num = (connection.syn_seq + 1 - len(packet.tcp.payload)) & 0xffffffff
 
             connection.fake_sent = True
+            self._send_fake_packet(packet, True)
 
-            if cfg.wrong_chksum:
-                packet.tcp.cksum = 0xdead
-                self._send_fake_packet(packet, False)
-            else:
-                self._send_fake_packet(packet, True)
-
-            # Strategy 3: Fake RST for DPI state poisoning
+            # 3. Fake RST state poisoning if enabled
             if cfg.fake_rst:
                 self._send_fake_rst(packet, connection)
 
-            # Check if destination server will ever send an ACK
-            # If low_ttl or wrong_chksum was used, server dropped/never saw the packet, so no ACK will arrive.
-            if cfg.low_ttl or cfg.wrong_chksum or not cfg.wrong_seq:
-                connection.monitor = False
-                connection.t2a_msg = "fake_sent_direct"
-                connection.running_loop.call_soon_threadsafe(connection.t2a_event.set)
+            # Release monitor immediately so real traffic starts flowing
+            connection.monitor = False
+            connection.t2a_msg = "fake_sent_direct"
+            connection.running_loop.call_soon_threadsafe(connection.t2a_event.set)
 
     def on_unexpected_packet(self, packet: Packet, connection: FakeInjectiveConnection, info_m: str):
         logger.debug("%s: %s", info_m, connection.id)
-        try:
-            connection.sock.close()
-        except Exception:
-            pass
-        try:
-            connection.peer_sock.close()
-        except Exception:
-            pass
         connection.monitor = False
-        connection.t2a_msg = "unexpected_close"
+        connection.t2a_msg = "released"
         connection.running_loop.call_soon_threadsafe(connection.t2a_event.set)
         try:
             self.w.send(packet, False)
@@ -187,28 +185,18 @@ class FakeTcpInjector(TcpInjector):
             self.w.send(packet, False)
             return
 
-        # Inbound ACK for fake data (server response to wrong_seq)
+        # Inbound ACK for fake data
         if packet.tcp.ack and not packet.tcp.syn and not packet.tcp.rst and not packet.tcp.fin and len(packet.tcp.payload) == 0 and connection.fake_sent:
-            seq_num = packet.tcp.seq_num
-            ack_num = packet.tcp.ack_num
-            if connection.syn_ack_seq == -1 or ((connection.syn_ack_seq + 1) & 0xffffffff) != seq_num:
-                self.on_unexpected_packet(packet, connection, "fake data ack seq mismatch")
-                return
-            if ack_num != ((connection.syn_seq + 1) & 0xffffffff):
-                self.on_unexpected_packet(packet, connection, "fake data ack ack mismatch")
-                return
-
             connection.monitor = False
             connection.t2a_msg = "fake_data_ack_recv"
             connection.running_loop.call_soon_threadsafe(connection.t2a_event.set)
             return
 
-        # Normal/other inbound packet
+        # Pass through other packets
         self.w.send(packet, False)
 
     def on_outbound_packet(self, packet: Packet, connection: FakeInjectiveConnection):
         if connection.sch_fake_sent:
-            # Fake already injected, let outbound traffic pass normally
             self.w.send(packet, False)
             return
 
@@ -232,8 +220,13 @@ class FakeTcpInjector(TcpInjector):
 
             self.w.send(packet, False)
             connection.sch_fake_sent = True
-            # Inject fake packet immediately without sleeping or spawning separate thread
-            self.fake_send_logic(packet, connection)
+            # In original code: threading.Thread(target=self.fake_send_thread, args=(packet, connection), daemon=True).start()
+            # with time.sleep(0.001) so the outbound handshake ACK leaves the OS before the fake packet is sent!
+            def _async_send_fake():
+                time.sleep(0.001)
+                self.fake_send_logic(packet, connection)
+
+            threading.Thread(target=_async_send_fake, daemon=True).start()
             return
 
         self.w.send(packet, False)

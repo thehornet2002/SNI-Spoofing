@@ -5,6 +5,7 @@ import os
 import socket
 import sys
 import threading
+import time
 from typing import Callable, Optional
 
 from fake_tcp import BypassConfig, FakeInjectiveConnection, FakeTcpInjector
@@ -27,29 +28,57 @@ def load_config_file(config_path: Optional[str] = None) -> dict:
         default_cfg = {
             "LISTEN_HOST": "0.0.0.0",
             "LISTEN_PORT": 40443,
-            "CONNECT_IP": "188.114.98.0",
+            "CONNECT_IP": "104.21.33.59",
             "CONNECT_PORT": 443,
-            "FAKE_SNI": "auth.vercel.com",
+            "FAKE_SNI": "hcaptcha.com",
             "BYPASS_OPTIONS": {
                 "wrong_seq": True,
-                "low_ttl": False,
-                "fake_ttl": 5,
-                "wrong_chksum": False,
+                "seq_offset_type": "classic",
+                "seq_offset_val": -1,
+                "fake_http": "none",
                 "fake_rst": False,
-                "fake_http": False,
-                "tls_frag": False,
-                "frag_mode": "sni",
-                "fake_ech": False,
-                "tcp_overlap": False,
-                "tcp_md5": False,
+                "use_npcap": True,
             },
         }
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(default_cfg, f, indent=2)
         return default_cfg
 
-    with open(config_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        logger.warning("Error reading config.json (%s), creating fresh default config", e)
+        default_cfg = {
+            "LISTEN_HOST": "0.0.0.0",
+            "LISTEN_PORT": 40443,
+            "CONNECT_IP": "104.21.33.59",
+            "CONNECT_PORT": 443,
+            "FAKE_SNI": "hcaptcha.com",
+            "BYPASS_OPTIONS": {
+                "wrong_seq": True,
+                "seq_offset_type": "classic",
+                "seq_offset_val": -1,
+                "fake_flags": "PA",
+                "fake_window": -1,
+                "fake_count": 1,
+                "fake_payload_type": "tls",
+                "fake_rst": False,
+                "fake_http": False,
+                "tls_frag": False,
+                "frag_mode": "sni",
+                "frag_delay": 0.002,
+                "fake_ech": False,
+                "tcp_overlap": False,
+                "tcp_md5": False,
+                "low_ttl": False,
+                "fake_ttl": 5,
+                "use_npcap": True,
+            },
+        }
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(default_cfg, f, indent=2)
+        return default_cfg
 
     # Ensure BYPASS_OPTIONS exists
     if "BYPASS_OPTIONS" not in data:
@@ -89,20 +118,14 @@ class ProxyEngine:
         self.fake_sni = config.get("FAKE_SNI", "auth.vercel.com")
 
         opts = config.get("BYPASS_OPTIONS", {})
-        self.bypass_config = BypassConfig(
+        self._bypass_config = BypassConfig(
             wrong_seq=opts.get("wrong_seq", True),
-            low_ttl=opts.get("low_ttl", False),
-            fake_ttl=int(opts.get("fake_ttl", 5)),
-            wrong_chksum=opts.get("wrong_chksum", False),
+            seq_offset_type=opts.get("seq_offset_type", "classic"),
+            seq_offset_val=int(opts.get("seq_offset_val", -1)),
+            fake_http=opts.get("fake_http", "none"),
             fake_rst=opts.get("fake_rst", False),
-            fake_http=opts.get("fake_http", False),
-            tls_frag=opts.get("tls_frag", False),
-            frag_mode=opts.get("frag_mode", "sni"),
-            fake_ech=opts.get("fake_ech", False),
-            tcp_overlap=opts.get("tcp_overlap", False),
-            tcp_md5=opts.get("tcp_md5", False),
-            use_npcap=opts.get("use_npcap", False),
             fake_sni=self.fake_sni,
+            use_npcap=opts.get("use_npcap", True),
         )
 
         self.fake_injective_connections: dict[tuple, FakeInjectiveConnection] = {}
@@ -113,6 +136,29 @@ class ProxyEngine:
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.mother_sock: Optional[socket.socket] = None
         self.interface_ipv4: str = ""
+
+    @property
+    def bypass_config(self) -> BypassConfig:
+        return self._bypass_config
+
+    @bypass_config.setter
+    def bypass_config(self, new_cfg: BypassConfig):
+        self._bypass_config = new_cfg
+        if self.fake_tcp_injector:
+            self.fake_tcp_injector.bypass_config = new_cfg
+
+    def wait_until_ready(self, timeout: float = 3.0) -> bool:
+        start_t = time.time()
+        while time.time() - start_t < timeout:
+            if self.is_running and self.mother_sock:
+                try:
+                    s = socket.create_connection(("127.0.0.1", self.listen_port), timeout=0.3)
+                    s.close()
+                    return True
+                except Exception:
+                    pass
+            time.sleep(0.1)
+        return False
 
     def log(self, message: str):
         logger.info(message)
@@ -132,20 +178,6 @@ class ProxyEngine:
                     data = await loop.sock_recv(sock_1, 65575)
                     if not data:
                         break
-
-                    # Handle TLS Fragmentation if enabled on the first client packet
-                    if first and is_client_to_server and self.bypass_config.tls_frag:
-                        if ClientHelloMaker.is_tls_client_hello(data):
-                            frags = ClientHelloMaker.split_for_sni_fragmentation(
-                                data, self.bypass_config.frag_mode
-                            )
-                            if len(frags) > 1:
-                                self.log(f"[FRAG] Splitting ClientHello into {len(frags)} segments ({self.bypass_config.frag_mode})")
-                                for frag in frags:
-                                    await loop.sock_sendall(sock_2, frag)
-                                    await asyncio.sleep(0.002)
-                                first = False
-                                continue
 
                     await loop.sock_sendall(sock_2, data)
                     first = False
@@ -172,15 +204,10 @@ class ProxyEngine:
         try:
             self.log(f"[+] New connection from {client_addr[0]}:{client_addr[1]}")
 
-            # Generate fake payload
-            if self.bypass_config.fake_ech:
-                fake_data = ClientHelloMaker.get_client_hello_with_ech(
-                    os.urandom(32), os.urandom(32), self.fake_sni.encode(), os.urandom(32)
-                )
-            else:
-                fake_data = ClientHelloMaker.get_client_hello_with(
-                    os.urandom(32), os.urandom(32), self.fake_sni.encode(), os.urandom(32)
-                )
+            # Generate fake payload (Original SNI spoofing template)
+            fake_data = ClientHelloMaker.get_client_hello_with(
+                os.urandom(32), os.urandom(32), self.fake_sni.encode(), os.urandom(32)
+            )
 
             outgoing_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             outgoing_sock.setblocking(False)
@@ -203,18 +230,11 @@ class ProxyEngine:
                 self.log(f"[-] Connect to {self.connect_ip}:{self.connect_port} failed: {e}")
                 return
 
-            # Wait for injection completion
-            cfg = self.bypass_config
-            if cfg.wrong_seq and not cfg.low_ttl and not cfg.wrong_chksum:
-                try:
-                    await asyncio.wait_for(fake_injective_conn.t2a_event.wait(), timeout=1.5)
-                except asyncio.TimeoutError:
-                    pass
-            else:
-                try:
-                    await asyncio.wait_for(fake_injective_conn.t2a_event.wait(), timeout=0.25)
-                except asyncio.TimeoutError:
-                    pass
+            # Wait for WinDivert 3-way handshake ACK interception and fake injection
+            try:
+                await asyncio.wait_for(fake_injective_conn.t2a_event.wait(), timeout=1.5)
+            except asyncio.TimeoutError:
+                pass
 
             fake_injective_conn.monitor = False
             if conn_id in self.fake_injective_connections:
@@ -246,9 +266,22 @@ class ProxyEngine:
 
     async def _server_main(self):
         self.loop = asyncio.get_running_loop()
+
+        def _ignore_shutdown_exc(loop, context):
+            exc = context.get("exception")
+            if isinstance(exc, OSError) and getattr(exc, "winerror", None) == 995:
+                return
+
+        self.loop.set_exception_handler(_ignore_shutdown_exc)
         self.mother_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.mother_sock.setblocking(False)
-        self.mother_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            try:
+                self.mother_sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except Exception:
+                self.mother_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        else:
+            self.mother_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.mother_sock.bind((self.listen_host, self.listen_port))
         self.mother_sock.listen(128)
 
@@ -259,21 +292,15 @@ class ProxyEngine:
         # Summary of active strategies
         active = []
         if self.bypass_config.wrong_seq:
-            active.append("wrong_seq")
-        if self.bypass_config.low_ttl:
-            active.append(f"low_ttl(ttl={self.bypass_config.fake_ttl})")
-        if self.bypass_config.wrong_chksum:
-            active.append("wrong_chksum")
+            active.append(f"wrong_seq({self.bypass_config.seq_offset_type})")
+        if self.bypass_config.fake_http != "none":
+            active.append(f"fake_http({self.bypass_config.fake_http})")
         if self.bypass_config.fake_rst:
             active.append("fake_rst")
-        if self.bypass_config.fake_http:
-            active.append("fake_http")
-        if self.bypass_config.tls_frag:
-            active.append(f"tls_frag({self.bypass_config.frag_mode})")
-        if self.bypass_config.fake_ech:
-            active.append("fake_ech")
-        if self.bypass_config.tcp_overlap:
-            active.append("tcp_overlap")
+        if self.bypass_config.use_npcap:
+            active.append("driver=Npcap")
+        else:
+            active.append("driver=WinDivert")
         self.log(f"[*] Active bypass strategies: {', '.join(active) if active else 'None'}")
 
         while self.is_running:
@@ -282,12 +309,18 @@ class ProxyEngine:
                 client_sock.setblocking(False)
                 client_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 asyncio.create_task(self._handle_connection(client_sock, client_addr))
+            except (OSError, asyncio.CancelledError):
+                if not self.is_running:
+                    break
             except Exception:
                 if not self.is_running:
                     break
 
     def _run_asyncio_thread(self):
-        asyncio.run(self._server_main())
+        try:
+            asyncio.run(self._server_main())
+        except Exception:
+            pass
 
     def start(self):
         if self.is_running:
@@ -299,54 +332,55 @@ class ProxyEngine:
 
         self.log(f"[*] Detected local IPv4: {self.interface_ipv4}")
 
-        # Initialize Npcap direct NIC injection if requested
-        if self.bypass_config.use_npcap:
-            try:
-                from utils.npcap_tools import find_npcap_dev_by_ip, get_mac_by_arp, NpcapDirectSender
-                import scapy.all as scapy
-                dev = find_npcap_dev_by_ip(self.interface_ipv4)
-                if dev:
-                    try:
-                        src_mac_str = scapy.get_if_hwaddr(dev["name"])
-                        src_mac = bytes.fromhex(src_mac_str.replace(":", "").replace("-", ""))
-                    except Exception:
-                        src_mac = None
+        if sys.platform == "win32":
+            # Initialize Npcap direct NIC injection if requested
+            if self.bypass_config.use_npcap:
+                try:
+                    from utils.npcap_tools import find_npcap_dev_by_ip, get_mac_by_arp, NpcapDirectSender
+                    import scapy.all as scapy
+                    dev = find_npcap_dev_by_ip(self.interface_ipv4)
+                    if dev:
+                        try:
+                            src_mac_str = scapy.get_if_hwaddr(dev["name"])
+                            src_mac = bytes.fromhex(src_mac_str.replace(":", "").replace("-", ""))
+                        except Exception:
+                            src_mac = None
 
-                    # Resolve gateway MAC
-                    gw_ip = "192.168.1.1"
-                    try:
-                        gw_ip = scapy.conf.route.route(self.connect_ip)[2]
-                    except Exception:
-                        pass
-                    gw_mac = get_mac_by_arp(gw_ip, self.interface_ipv4) if gw_ip else None
+                        # Resolve gateway MAC
+                        gw_ip = "192.168.1.1"
+                        try:
+                            gw_ip = scapy.conf.route.route(self.connect_ip)[2]
+                        except Exception:
+                            pass
+                        gw_mac = get_mac_by_arp(gw_ip, self.interface_ipv4) if gw_ip else None
 
-                    self.npcap_sender = NpcapDirectSender(dev["name"], src_mac, gw_mac)
-                    self.log(f"[✓] Npcap Direct NIC injection enabled on: {dev['description']}")
-                else:
-                    self.log(f"[-] Npcap adapter for {self.interface_ipv4} not found, using WinDivert fallback.")
-            except Exception as e:
-                self.log(f"[-] Failed to initialize Npcap: {e}, using WinDivert fallback.")
+                        self.npcap_sender = NpcapDirectSender(dev["name"], src_mac, gw_mac)
+                        self.log(f"[✓] Npcap Direct NIC injection enabled on: {dev['description']}")
+                    else:
+                        self.log(f"[-] Npcap adapter for {self.interface_ipv4} not found, using WinDivert fallback.")
+                except Exception as e:
+                    self.log(f"[-] Failed to initialize Npcap: {e}, using WinDivert fallback.")
 
-        # Build WinDivert filter
-        w_filter = (
-            f"tcp and ("
-            f"(ip.SrcAddr == {self.interface_ipv4} and ip.DstAddr == {self.connect_ip}) or "
-            f"(ip.SrcAddr == {self.connect_ip} and ip.DstAddr == {self.interface_ipv4})"
-            f")"
-        )
+            # Build original WinDivert filter with local interface IPv4 and destination IP
+            w_filter = (
+                f"tcp and ("
+                f"(ip.SrcAddr == {self.interface_ipv4} and ip.DstAddr == {self.connect_ip}) or "
+                f"(ip.SrcAddr == {self.connect_ip} and ip.DstAddr == {self.interface_ipv4})"
+                f")"
+            )
 
-        self.fake_tcp_injector = FakeTcpInjector(
-            w_filter, self.fake_injective_connections, self.bypass_config,
-            npcap_sender=self.npcap_sender
-        )
+            self.fake_tcp_injector = FakeTcpInjector(
+                w_filter, self.fake_injective_connections, self.bypass_config,
+                npcap_sender=self.npcap_sender
+            )
+            self.injector_thread = threading.Thread(
+                target=self.fake_tcp_injector.run, daemon=True, name="WinDivertInjector"
+            )
+            self.injector_thread.start()
+        else:
+            self.log("[i] Running in Linux mode (Proxy & Socket level).")
 
         self.is_running = True
-
-        # Start injector in separate thread
-        self.injector_thread = threading.Thread(
-            target=self.fake_tcp_injector.run, daemon=True, name="WinDivertInjector"
-        )
-        self.injector_thread.start()
 
         # Start asyncio proxy server in separate thread
         self.loop_thread = threading.Thread(
