@@ -1,37 +1,47 @@
-import sys
+import logging
 from abc import ABC, abstractmethod
-
 from pydivert import WinDivert, Packet
 
-
-# from pydivert.consts import *
+logger = logging.getLogger("TcpInjector")
 
 
 class TcpInjector(ABC):
     def __init__(self, w_filter: str):
-        # self.interface_ipv4 = interface_ipv4
-        # self.interface_ipv6 = interface_ipv6
-        # ip_filter = ip4_filter = ip6_filter = ""
-        # if self.interface_ipv4:
-        #     ip4_filter = "(ip.SrcAddr == " + self.interface_ipv4 + " or ip.DstAddr == " + self.interface_ipv4 + ")"
-        #     ip_filter = ip4_filter
-        # if self.interface_ipv6:
-        #     ip6_filter = "(ipv6.SrcAddr == " + self.interface_ipv6 + " or ipv6.DstAddr == " + self.interface_ipv6 + ")"
-        #     ip_filter = ip6_filter
-        # if self.interface_ipv4 and self.interface_ipv6:
-        #     ip_filter = "(" + ip4_filter + " or " + ip6_filter + ")"
-        #
-        # self.filter = "tcp"
-        # if ip_filter:
-        #     self.filter += " and " + ip_filter
-        self.w: WinDivert = WinDivert(w_filter)
+        self.w_filter = w_filter
+        self.w: WinDivert | None = None
+        self.running = False
 
     @abstractmethod
     def inject(self, packet: Packet):
-        sys.exit("Not implemented")
+        pass
 
     def run(self):
-        with self.w:
-            while True:
-                packet = self.w.recv(65575)
-                self.inject(packet)
+        self.running = True
+        try:
+            self.w = WinDivert(self.w_filter)
+            with self.w:
+                while self.running:
+                    try:
+                        packet = self.w.recv(65575)
+                        if not self.running:
+                            break
+                        self.inject(packet)
+                    except Exception as e:
+                        if not self.running:
+                            break
+                        logger.debug("WinDivert recv error: %s", e)
+        except PermissionError:
+            logger.error("WinDivert requires Administrator privileges.")
+            raise
+        except Exception as e:
+            logger.error("WinDivert loop error: %s", e)
+        finally:
+            self.running = False
+
+    def stop(self):
+        self.running = False
+        try:
+            if self.w and self.w.is_open:
+                self.w.close()
+        except Exception:
+            pass

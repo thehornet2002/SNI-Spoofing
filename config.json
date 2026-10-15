@@ -3,5 +3,19 @@
   "LISTEN_PORT": 40443,
   "CONNECT_IP": "188.114.98.0",
   "CONNECT_PORT": 443,
-  "FAKE_SNI": "auth.vercel.com"
+  "FAKE_SNI": "auth.vercel.com",
+  "BYPASS_OPTIONS": {
+    "wrong_seq": true,
+    "low_ttl": false,
+    "fake_ttl": 5,
+    "wrong_chksum": false,
+    "fake_rst": false,
+    "fake_http": false,
+    "tls_frag": false,
+    "frag_mode": "sni",
+    "fake_ech": false,
+    "tcp_overlap": false,
+    "tcp_md5": false,
+    "use_npcap": true
+  }
 }
